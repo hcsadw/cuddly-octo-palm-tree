@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<title>Plants vs. Zombies</title>
+		<!--<script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>-->
+		<style>
+			* {
+				box-sizing: border-box;
+				margin: 0;
+				padding: 0;
+			}
+			body {
+				background: #000;
+				color: #fff;
+				font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+				min-height: 100vh;
+			}
+			body.upload-mode {
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				overflow: hidden;
+			}
+			body.game-mode {
+				overflow: hidden;
+			}
+			#upload-screen {
+				text-align: center;
+				padding: 1.5em;
+			}
+			#loading-status {
+				font-size: 1.3em;
+				color: #fff;
+				animation: pulse 1.6s ease-in-out infinite;
+			}
+			#loading-status.has-error {
+				color: #e74c3c;
+				animation: none;
+				max-width: 480px;
+			}
+			@keyframes pulse {
+				0%,
+				100% {
+					opacity: 0.55;
+				}
+				50% {
+					opacity: 1;
+				}
+			}
+			#canvas-container {
+				display: none;
+				width: 100vw;
+				height: 100vh;
+				position: fixed;
+				inset: 0;
+				justify-content: center;
+				align-items: center;
+				background: #000;
+				overflow: hidden;
+			}
+			#canvas-container:fullscreen {
+				width: 100%;
+				height: 100%;
+			}
+			canvas#canvas {
+				display: block;
+				background: #000;
+				outline: 0;
+			}
+			#pvz-soft-keyboard {
+				position: fixed;
+				top: 0;
+				left: 0;
+				width: 1px;
+				height: 1px;
+				padding: 0;
+				border: 0;
+				opacity: 0;
+				resize: none;
+				pointer-events: none;
+				font-size: 16px;
+			}
+			#save-toolbar {
+				position: absolute;
+				top: 8px;
+				right: 8px;
+				display: flex;
+				gap: 6px;
+				z-index: 10;
+				flex-wrap: wrap;
+				justify-content: flex-end;
+				max-width: calc(100vw - 16px);
+			}
+			#save-toolbar button {
+				background: rgba(30, 30, 50, 0.75);
+				color: #4ecca3;
+				border: 1px solid #4ecca3;
+				border-radius: 6px;
+				padding: 0.35em 0.8em;
+				font-size: 0.85em;
+				cursor: pointer;
+				backdrop-filter: blur(4px);
+				transition: background 0.2s;
+			}
+			#save-toolbar button:hover {
+				background: rgba(78, 204, 163, 0.2);
+			}
+			#save-toolbar button:disabled {
+				opacity: 0.4;
+				cursor: default;
+			}
+		</style>
+	</head>
+	<body class="upload-mode">
+		<div id="upload-screen">
+			<p id="loading-status">Loading game…</p>
+		</div>
+		<div id="canvas-container">
+			<div id="save-toolbar">
+				<button id="save-export-btn" title="Export saves as ZIP" style="display: none">
+					💾 Export Saves
+				</button>
+			</div>
+			<canvas id="canvas" width="800" height="600" tabindex="0"></canvas>
+		</div>
+		<textarea
+			id="pvz-soft-keyboard"
+			autocapitalize="off"
+			autocomplete="off"
+			autocorrect="off"
+			enterkeyhint="done"
+			spellcheck="false"
+		></textarea>
+		<script>
+			window.moduleReadyPromise = new Promise(function (n, e) {
+				((window._resolveModuleReady = n), (window._rejectModuleReady = e));
+			});
+			var Module = {
+				canvas: document.getElementById("canvas"),
+				noInitialRun: !0,
+				onRuntimeInitialized: function () {
+					window._resolveModuleReady();
+				},
+				onAbort: function (n) {
+					window._rejectModuleReady(new Error(n));
+				},
+				print: function (n) {
+					console.log(n);
+				},
+				printErr: function (n) {
+					console.warn(n);
+				},
+			};
+			Module.canvas.addEventListener("contextmenu", function (n) {
+				n.preventDefault();
+			});
+		</script>
+		<script src="script.js" async></script>
+		<script>
+			"use strict";
+
+			const collectedFiles = new Map();
+			let savesMounted = false,
+				gameStarted = false,
+				saveSyncIntervalId = null,
+				saveSyncInFlight = null,
+				saveSyncQueued = false,
+				lastSaveSyncAt = 0,
+				saveFsReadyPromise = null,
+				runtimeReloadScheduled = false;
+
+			const SAVE_SYNC_INTERVAL_MS = 5000,
+				SAVE_CLOSE_WARNING_MS = 7000,
+				loadingStatus = document.getElementById("loading-status");
+
+			// Game resources are expected to sit next to this HTML file with this layout:
+			//   main.pak
+			//   properties/default.xml
+			//   properties/Layout.xml
+			//   properties/partner.xml
+			//   properties/partner.xml.sig
+			//   properties/partner_logo.jpg
+			const AUTO_RESOURCE_FILES = [
+				["main.pak.part1", "main.pak.part2"], // reassembled into "main.pak"
+				"properties/default.xml",
+				"properties/Layout.xml",
+				"properties/partner.xml",
+				"properties/partner.xml.sig",
+				"properties/partner_logo.jpg",
+			];
+
+			async function fetchAsCollectedFile(entry) {
+				if (Array.isArray(entry)) {
+					// multi-part file — fetch and concatenate in order
+					const blobs = [];
+					for (const path of entry) {
+						const res = await fetch(path, { cache: "no-store" });
+						if (!res.ok) throw new Error("HTTP " + res.status);
+						blobs.push(await res.blob());
+					}
+					const combined = new Blob(blobs);
+					const name = entry[0].replace(/\.part\d+$/, ""); // "main.pak.part1" -> "main.pak"
+					return new File([combined], name);
+				}
+				const res = await fetch(entry, { cache: "no-store" });
+				if (!res.ok) throw new Error("HTTP " + res.status);
+				const blob = await res.blob();
+				return new File([blob], entry.split("/").pop());
+			}
+
+			async function autoLoadGameFiles() {
+				loadingStatus.classList.remove("has-error");
+				loadingStatus.textContent = "Loading game…";
+				for (const entry of AUTO_RESOURCE_FILES) {
+					const key = Array.isArray(entry)
+						? entry[0].replace(/\.part\d+$/, "") // "main.pak.part1" -> "main.pak"
+						: entry;
+					try {
+						collectedFiles.set(key, await fetchAsCollectedFile(entry));
+					} catch (e) {
+						console.warn('Could not fetch "' + key + '":', e);
+					}
+				}
+				if (!collectedFiles.has("main.pak")) {
+					loadingStatus.classList.add("has-error");
+					loadingStatus.textContent =
+						"Couldn't load the game. Make sure main.pak and the properties/ folder are placed next to this HTML file and served over http/https.";
+					return;
+				}
+				await startGame();
+			}
+
+			function resizeCanvas() {
+				var canvas = document.getElementById("canvas"),
+					container = document.getElementById("canvas-container"),
+					w = container.clientWidth,
+					h = container.clientHeight,
+					scale = Math.min(w / canvas.width, h / canvas.height);
+				canvas.style.width = Math.floor(canvas.width * scale) + "px";
+				canvas.style.height = Math.floor(canvas.height * scale) + "px";
+			}
+
+			function canSyncSaves() {
+				return savesMounted && Module.FS && typeof Module.FS.syncfs === "function";
+			}
+
+			async function ensureSaveFsReady() {
+				return (
+					saveFsReadyPromise ||
+					((saveFsReadyPromise = (async () => {
+						await window.moduleReadyPromise;
+						try {
+							Module.FS.mkdir("/saves");
+						} catch (e) {}
+						try {
+							Module.FS.mount(Module.FS.filesystems.IDBFS, {}, "/saves");
+						} catch (e) {}
+						savesMounted = true;
+						await new Promise((resolve) =>
+							Module.FS.syncfs(true, (err) => {
+								if (err) console.warn("IDBFS initial sync error:", err);
+								resolve();
+							}),
+						);
+						lastSaveSyncAt = Date.now();
+					})()),
+					saveFsReadyPromise)
+				);
+			}
+
+			async function syncSaves() {
+				if (!canSyncSaves()) return;
+				if (saveSyncInFlight) {
+					saveSyncQueued = true;
+					return saveSyncInFlight;
+				}
+				saveSyncInFlight = new Promise((resolve) =>
+					Module.FS.syncfs(false, (err) => {
+						if (err) console.warn("IDBFS persist error:", err);
+						else lastSaveSyncAt = Date.now();
+						resolve();
+					}),
+				);
+				try {
+					await saveSyncInFlight;
+				} finally {
+					saveSyncInFlight = null;
+					if (saveSyncQueued) {
+						saveSyncQueued = false;
+						syncSaves();
+					}
+				}
+			}
+
+			function startSaveAutosync() {
+				if (saveSyncIntervalId === null) {
+					saveSyncIntervalId = window.setInterval(() => {
+						syncSaves();
+					}, SAVE_SYNC_INTERVAL_MS);
+				}
+			}
+
+			async function startGame() {
+				try {
+					loadingStatus.textContent = "Preparing WebAssembly runtime…";
+					await window.moduleReadyPromise;
+
+					const entries = Array.from(collectedFiles.entries());
+					let written = 0;
+					const total = entries.reduce((sum, [, file]) => sum + file.size, 0);
+
+					for (let i = 0; i < entries.length; i++) {
+						const [path, file] = entries[i];
+						loadingStatus.textContent =
+							"Writing resources… " +
+							(i + 1) +
+							"/" +
+							entries.length +
+							", " +
+							(written / 1048576).toFixed(1) +
+							"/" +
+							(total / 1048576).toFixed(1) +
+							" MiB";
+
+						const data = new Uint8Array(await file.arrayBuffer());
+						const parts = path.split("/");
+						let dir = "/";
+						for (let j = 0; j < parts.length - 1; j++) {
+							dir += (dir === "/" ? "" : "/") + parts[j];
+							try {
+								Module.FS.mkdir(dir);
+							} catch (e) {}
+						}
+						Module.FS.writeFile("/" + path, data);
+						written += file.size;
+						if ((i + 1) % 4 === 0) await new Promise((r) => setTimeout(r, 0));
+					}
+
+					loadingStatus.textContent = "Starting game…";
+					await ensureSaveFsReady();
+
+					document.body.classList.remove("upload-mode");
+					document.body.classList.add("game-mode");
+					document.getElementById("upload-screen").style.display = "none";
+					document.getElementById("canvas-container").style.display = "flex";
+					resizeCanvas();
+					window.addEventListener("resize", resizeCanvas);
+
+					gameStarted = true;
+					lastSaveSyncAt = Date.now();
+					startSaveAutosync();
+					Module.callMain([]);
+				} catch (e) {
+					console.error("Failed to start game:", e);
+					loadingStatus.classList.add("has-error");
+					loadingStatus.textContent = "Error: " + (e.message || e);
+					document.getElementById("canvas-container").style.display = "none";
+					document.getElementById("upload-screen").style.display = "";
+					document.body.classList.remove("game-mode");
+					document.body.classList.add("upload-mode");
+				}
+			}
+
+			function collectSaveFiles(dirPath) {
+				const out = [];
+				let entries;
+				try {
+					entries = Module.FS.readdir(dirPath);
+				} catch (e) {
+					return out;
+				}
+				for (const name of entries) {
+					if (name === "." || name === "..") continue;
+					const full = dirPath + "/" + name;
+					const stat = Module.FS.stat(full);
+					if (Module.FS.isDir(stat.mode)) out.push(...collectSaveFiles(full));
+					else out.push(full);
+				}
+				return out;
+			}
+
+			async function exportSaves() {
+				const btn = document.getElementById("save-export-btn");
+				btn.disabled = true;
+				btn.textContent = "⏳ Exporting…";
+				try {
+					await ensureSaveFsReady();
+					await syncSaves();
+					const files = collectSaveFiles("/saves/userdata");
+					if (files.length === 0) return void alert("No save data found.");
+					const zip = new JSZip();
+					for (const f of files)
+						zip.file(f.replace(/^\/saves\//, ""), Module.FS.readFile(f));
+					const blob = await zip.generateAsync({ type: "blob" });
+					const a = document.createElement("a");
+					a.href = URL.createObjectURL(blob);
+					a.download = "pvz-portable-savedata.zip";
+					a.click();
+					URL.revokeObjectURL(a.href);
+				} catch (e) {
+					console.error("Export failed:", e);
+					alert("Export failed: " + e.message);
+				} finally {
+					btn.disabled = false;
+					btn.textContent = "💾 Export Saves";
+				}
+			}
+
+			document
+				.getElementById("save-export-btn")
+				.addEventListener("click", exportSaves);
+			window.addEventListener("fullscreenchange", resizeCanvas);
+
+			document.addEventListener("visibilitychange", () => {
+				if (document.visibilityState === "hidden") syncSaves();
+			});
+			window.addEventListener("pagehide", () => {
+				syncSaves();
+			});
+			window.addEventListener("beforeunload", (e) => {
+				if (gameStarted) {
+					syncSaves();
+					if (Date.now() - lastSaveSyncAt >= SAVE_CLOSE_WARNING_MS) {
+						e.preventDefault();
+						e.returnValue =
+							"Recent save data may still be syncing. Wait a moment or export saves before leaving.";
+					}
+				}
+			});
+
+			window.onGameExit = function () {
+				gameStarted = false;
+				if (saveSyncIntervalId !== null) {
+					clearInterval(saveSyncIntervalId);
+					saveSyncIntervalId = null;
+				}
+				if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+				document.getElementById("canvas-container").style.display = "none";
+				document.getElementById("upload-screen").style.display = "";
+				document.body.classList.remove("game-mode");
+				document.body.classList.add("upload-mode");
+				window.removeEventListener("resize", resizeCanvas);
+				collectedFiles.clear();
+				if (!runtimeReloadScheduled) {
+					runtimeReloadScheduled = true;
+					loadingStatus.classList.remove("has-error");
+					loadingStatus.textContent = "Resetting…";
+					window.setTimeout(() => window.location.reload(), 0);
+				}
+			};
+
+			autoLoadGameFiles();
+		</script>
+	</body>
+</html>
